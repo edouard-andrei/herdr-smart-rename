@@ -1,0 +1,33 @@
+id = "edi.smart-rename"
+name = "Smart Rename"
+version = "0.2.0"
+min_herdr_version = "0.8.0"
+description = "AI tab and pane names from agent work — transcript-aware, one keypress."
+platforms = ["linux", "macos"]
+
+[[actions]]
+id = "rename-tab"
+title = "Smart rename tab"
+contexts = ["global", "workspace", "tab", "pane"]
+command = ["node", "rename.mjs", "--target", "tab"]
+
+[[actions]]
+id = "rename-pane"
+title = "Smart rename pane"
+contexts = ["global", "workspace", "tab", "pane"]
+command = ["node", "rename.mjs", "--target", "pane"]
+
+# Keybindings are NOT declared here — herdr manifests only declare actions.
+# Bind in ~/.config/herdr/config.toml, then `herdr server reload-config`:
+#
+#   [[keys.command]]
+#   key = "prefix+a"
+#   type = "plugin_action"
+#   command = "edi.smart-rename.rename-tab"
+#   description = "smart rename tab"
+#
+#   [[keys.command]]
+#   key = "prefix+shift+a"
+#   type = "plugin_action"
+#   command = "edi.smart-rename.rename-pane"
+#   description = "smart rename pane"
