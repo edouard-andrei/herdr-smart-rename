@@ -21,7 +21,7 @@ const fileEnv = ENV_FILE && existsSync(ENV_FILE) ? parseEnv(readFileSync(ENV_FIL
 const cfg = (key, fallback) => process.env[key] ?? fileEnv[key] ?? fallback;
 
 const BASE_URL = cfg('SMART_RENAME_BASE_URL', 'https://api.openai.com/v1').replace(/\/+$/, '');
-const MODEL = cfg('SMART_RENAME_MODEL', 'gpt-5-mini');
+const MODEL = cfg('SMART_RENAME_MODEL', 'gpt-5.6-luna');
 const API_KEY = cfg('SMART_RENAME_API_KEY') ?? cfg('OPENAI_API_KEY');
 // Empty value omits the field — providers that reject it (Anthropic, Ollama) need that.
 const REASONING_EFFORT = cfg('SMART_RENAME_REASONING_EFFORT', 'low');

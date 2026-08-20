@@ -63,7 +63,7 @@ Settings are read from `.env` in `herdr plugin config-dir edi.smart-rename`. Rea
 | --- | --- | --- |
 | `SMART_RENAME_API_KEY` | falls back to `OPENAI_API_KEY` | Required. |
 | `SMART_RENAME_BASE_URL` | `https://api.openai.com/v1` | Any OpenAI-compatible endpoint. |
-| `SMART_RENAME_MODEL` | `gpt-5-mini` | A small, fast model is the right pick here. |
+| `SMART_RENAME_MODEL` | `gpt-5.6-luna` | A small, fast model is the right pick here. |
 | `SMART_RENAME_REASONING_EFFORT` | `low` | Set empty to omit the field for providers that reject it. |
 
 Some working combinations:
@@ -85,7 +85,7 @@ SMART_RENAME_MODEL=qwen3:8b
 SMART_RENAME_REASONING_EFFORT=
 ```
 
-One call is roughly 500 tokens in, a handful out, so a small model at low reasoning effort is both the cheapest and the fastest choice (~1.5s round trip). Bigger models were benchmarked and produced the same labels.
+One call is roughly 530 tokens in, a handful out, so a small model at low reasoning effort is both the cheapest and the fastest choice (~1.5s round trip). Low effort is deliberate: benchmarked against high, max, and `gpt-5.6-sol` — identical label quality, lowest latency.
 
 Run with `DEBUG=1` to print the context sent to the model on stderr.
 
