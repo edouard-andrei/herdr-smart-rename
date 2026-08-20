@@ -2,10 +2,16 @@
 
 AI names for [herdr](https://herdr.dev) tabs and panes, on one keypress. No background watching: the rename runs only when you trigger it.
 
-## Actions
+## What it does
 
-- `rename-tab` — names the current tab. With two or more agent panes, all agents are peers: one summary line each, and the model names their common theme with an umbrella label. Otherwise the dominant pane (focused agent, else any working or blocked agent, else the focused pane) gets full context and other panes add one line as supporting evidence. Support panes (servers, logs) never define the name.
-- `rename-pane` — names the invoking pane after its own work.
+| Action | Key | What it does |
+| --- | --- | --- |
+| **Smart rename tab** | `prefix+a` | Names the current tab after the work in it. |
+| **Smart rename pane** | `prefix+shift+a` | Names the invoking pane after its own work. |
+
+Both keys are free in herdr's defaults. Bind them yourself, see [Install](#install).
+
+Renaming a tab with two or more agent panes treats the agents as peers: one summary line each, and the model names their common theme with an umbrella label. With a single agent, the dominant pane (focused agent, else any working or blocked agent, else the focused pane) gets full context and the other panes add one line as supporting evidence. Support panes (servers, logs) never define the name.
 
 ## Signals, in order of quality
 
