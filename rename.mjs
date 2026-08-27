@@ -1,8 +1,8 @@
 // Smart rename: name the current tab or pane after the work happening inside it.
 // --target tab  → dominant-pane hierarchy (focused agent > active agent > focused > first)
 // --target pane → the invoking pane only.
-// Signals: pane metadata + Claude transcript prompts (first + last two), else recent
-// terminal output. Known plain processes get deterministic names without a model call.
+// Signals: pane metadata + agent transcript prompts (the first, then a budget-filled tail),
+// else recent terminal output. Known plain processes get deterministic names without a model call.
 import { execFileSync } from 'node:child_process';
 import { readFileSync, readdirSync, existsSync, globSync } from 'node:fs';
 import { homedir } from 'node:os';
@@ -12,6 +12,11 @@ import { parseEnv } from 'node:util';
 const BIN = process.env.HERDR_BIN_PATH || 'herdr';
 const HOME = homedir();
 const MAX_CONTEXT = 4500;
+// The first prompt carries the mission, so it gets the larger budget. Recent
+// prompts are capped individually, then fill a shared budget from the end.
+const FIRST_PROMPT_CHARS = 800;
+const RECENT_PROMPT_CHARS = 250;
+const RECENT_BUDGET_CHARS = 2500;
 
 // Config: real env vars win, then `.env` in the herdr-managed plugin config dir
 // (`herdr plugin config-dir edi.smart-rename`). See README for the keys.
@@ -23,7 +28,7 @@ const cfg = (key, fallback) => process.env[key] ?? fileEnv[key] ?? fallback;
 const BASE_URL = cfg('SMART_RENAME_BASE_URL', 'https://api.openai.com/v1').replace(/\/+$/, '');
 const MODEL = cfg('SMART_RENAME_MODEL', 'gpt-5.6-luna');
 const API_KEY = cfg('SMART_RENAME_API_KEY') ?? cfg('OPENAI_API_KEY');
-// Empty value omits the field — providers that reject it (Anthropic, Ollama) need that.
+// Empty value omits the field, providers that reject it (Anthropic, Ollama) need that.
 const REASONING_EFFORT = cfg('SMART_RENAME_REASONING_EFFORT', 'low');
 
 const herdr = (...args) => {
@@ -32,6 +37,10 @@ const herdr = (...args) => {
 };
 
 const fail = (msg) => { console.error(`smart-rename: ${msg}`); process.exit(1); };
+
+// Cut marker included on purpose: the model should know content is missing
+// instead of over-fitting to the fragment it sees.
+const clip = (s, max) => (s.length <= max ? s : `${s.slice(0, max)}…`);
 
 const sanitize = (s) =>
   s
@@ -45,9 +54,12 @@ const sanitize = (s) =>
 const target = process.argv[process.argv.indexOf('--target') + 1];
 if (target !== 'tab' && target !== 'pane') fail('need --target tab|pane');
 const selfId = process.env.HERDR_PANE_ID;
-if (!selfId) fail('HERDR_PANE_ID not set — run as a herdr plugin action');
+if (!selfId) fail('HERDR_PANE_ID not set, run as a herdr plugin action');
 
 const self = herdr('pane', 'get', selfId).result.pane;
+// The current label is a weak prior: it steadies re-runs on an already named target,
+// and the prompt tells the model when to drop it.
+const previous = target === 'tab' ? herdr('tab', 'get', self.tab_id).result.tab.label : self.label;
 let pane = self;
 let siblings = [];
 if (target === 'tab') {
@@ -60,7 +72,19 @@ if (target === 'tab') {
 
 // ---------- context gathering ----------
 
-// Last real user prompts from an agent session transcript: first + last two.
+// A skill invocation arrives as `<command-name>/x</command-name><command-args>…</command-args>`,
+// followed by the expanded skill body as a second user turn. The invocation carries the
+// subject (ticket, PR number, intent); the body is the skill's generic mission, so it is
+// dropped. Other '<'/'#' prefixes are injected noise: system reminders, env context, AGENTS.md.
+function userPrompt(text) {
+  if (!text) return null;
+  const cmd = text.match(/<command-name>([^<]*)<\/command-name>(?:\s*<command-args>([^<]*)<\/command-args>)?/);
+  if (cmd) return `${cmd[1]} ${cmd[2] ?? ''}`.trim();
+  if (text.startsWith('<') || text.startsWith('#') || text.startsWith('Base directory for this skill:')) return null;
+  return text.length < 10 ? null : text;
+}
+
+// User prompts from an agent session transcript: the first, then a budget-filled tail.
 function agentPrompts(p) {
   const id = p.agent_session?.value;
   if (!id) return null;
@@ -90,13 +114,40 @@ function agentPrompts(p) {
   for (const line of readFileSync(file, 'utf8').split('\n')) {
     let entry;
     try { entry = JSON.parse(line); } catch { continue; }
-    const text = extract(entry);
-    // '<'/'#' prefixes are injected noise: system reminders, env context, AGENTS.md.
-    if (!text || text.startsWith('<') || text.startsWith('#') || text.length < 10) continue;
-    prompts.push(text.slice(0, 250));
+    const text = userPrompt(extract(entry));
+    if (text) prompts.push(text);
   }
   if (!prompts.length) return null;
-  return { first: prompts[0], recent: prompts.slice(-2) };
+  // The first prompt never repeats as a recent one, so a short session sends it once.
+  const rest = prompts.slice(1);
+  // Fill the budget from the end rather than taking a fixed count. A pivot ("actually,
+  // let's do X instead") lands mid-session, and a two-prompt window drops it.
+  const recent = [];
+  let used = 0;
+  for (const text of rest.toReversed()) {
+    const entry = clip(text, RECENT_PROMPT_CHARS);
+    if (used + entry.length > RECENT_BUDGET_CHARS) break;
+    recent.unshift(entry);
+    used += entry.length;
+  }
+  return { first: clip(prompts[0], FIRST_PROMPT_CHARS), recent, omitted: rest.length - recent.length };
+}
+
+// A first prompt that names a PR ("/pr-address 687", "PR 687", "#687") rarely says what
+// the PR is about. One `gh` call (~0.5s) fetches the title so the label can name the
+// feature, not just the number. Any failure (no gh, no auth, not a GitHub repo) is skipped.
+function prTitle(first, cwd) {
+  const m = first.match(/(?:\bpr\S*|\bpull request|#)\s*(\d{1,6})\b/i);
+  if (!m) return null;
+  try {
+    const out = execFileSync('gh', ['pr', 'view', m[1], '--json', 'title,headRefName'], {
+      cwd, encoding: 'utf8', timeout: 3000, stdio: ['ignore', 'pipe', 'ignore'],
+    });
+    const { title, headRefName } = JSON.parse(out);
+    return `PR ${m[1]}: ${title} (branch ${headRefName})`;
+  } catch {
+    return null;
+  }
 }
 
 function processInfo(p) {
@@ -108,7 +159,7 @@ function processInfo(p) {
   }
 }
 
-// Deterministic names for well-known plain processes — no model call needed.
+// Deterministic names for well-known plain processes, no model call needed.
 const DETERMINISTIC = [
   [/\b(vitest|jest|playwright|pytest|cargo test)\b/, 'run-tests'],
   [/\b(vite|next dev|nuxt dev|astro dev|webpack)\b|\b(pnpm|npm|bun|yarn) (run )?dev\b/, 'dev-server'],
@@ -123,7 +174,7 @@ const agentPanes = siblings.filter((p) => p.agent);
 const umbrella = agentPanes.length >= 2;
 
 const proc = pane.agent ? null : processInfo(pane);
-// Deterministic names only when the pane stands alone — a multi-pane tab
+// Deterministic names only when the pane stands alone. A multi-pane tab
 // should get a general name from the model instead.
 if (proc && !others.length) {
   const hit = DETERMINISTIC.find(([re]) => re.test(proc.cmdline));
@@ -153,7 +204,10 @@ if (umbrella) {
   const prompts = agentPrompts(pane);
   if (prompts) {
     parts.push(`First user request of the session:\n${prompts.first}`);
-    parts.push(`Most recent requests:\n${prompts.recent.join('\n')}`);
+    const pr = prTitle(prompts.first, pane.cwd);
+    if (pr) parts.push(pr);
+    if (prompts.omitted) parts.push(`[${prompts.omitted} earlier requests omitted]`);
+    if (prompts.recent.length) parts.push(`Most recent requests:\n${prompts.recent.join('\n')}`);
   } else {
     const tail = execFileSync(BIN, ['pane', 'read', pane.pane_id], { encoding: 'utf8' })
       .split('\n').slice(-40).join('\n');
@@ -166,25 +220,66 @@ if (umbrella) {
     parts.push(...others.map(paneLine));
   }
 }
-const context = sanitize(parts.join('\n')).slice(0, MAX_CONTEXT);
+if (previous) parts.push(`Current label: ${previous}`);
+const context = clip(sanitize(parts.join('\n')), MAX_CONTEXT);
 if (process.env.DEBUG) console.error(`--- context ---\n${context}\n---`);
 
 // ---------- model call ----------
 
-const SYSTEM =
-  `You name terminal ${target}s. Reply with ONLY a label: 2-4 lowercase words joined by dashes, under 30 characters. ` +
-  'Keep ticket ids (like fe-1234) when they identify the work. Never tool, model, or agent names. ' +
-  (umbrella
-    ? 'Several agents run in parallel in this tab: name their COMMON theme with one umbrella label.' +
-      " Never name just one agent's task. Supporting processes (servers, logs, shells) never define the name."
-    : 'Name the OVERALL task of the session, not the latest step; recent requests only refine the topic.' +
-      (others.length
-        ? ' The tab holds several panes: name the tab’s overall work. Supporting processes (servers, logs,' +
-          ' shells) never define the name.'
-        : ''));
+// Scope rules first, then the general ones. The examples matter most: a small
+// model at low effort learns "durable subject, not latest step" from a contrast
+// pair far better than from another rule.
+const scopeRules = umbrella
+  ? [
+      'Several agents run in parallel in this tab: label their COMMON theme with one umbrella label.',
+      "Never label just one agent's task.",
+    ]
+  : [
+      'Label the OVERALL task of the session, not the latest step. Recent requests only refine the topic.',
+      // Both directions are needed. The narrowing rule alone anchors so hard on the
+      // first request that a real pivot gets ignored.
+      'The first request sets the subject until a later request clearly changes what the session is about.',
+      'Later requests that only narrow to one detail, dependency or provider do not change the subject.',
+      ...(others.length ? ["The tab holds several panes: label the tab's overall work."] : []),
+    ];
+
+const SYSTEM = [
+  `You name terminal ${target}s. Reply with ONLY a label: 2-4 lowercase words joined by dashes, under 30 characters.`,
+  '',
+  'First, silently reduce the session to:',
+  '- Subject: what system, feature or problem is this about?',
+  '- Outcome: what does the user want to change or understand?',
+  '- Incidental: what only describes how the agent should do the work?',
+  'Label the subject and outcome. Discard the incidental instructions.',
+  '',
+  'Rules:',
+  ...scopeRules.map((rule) => `- ${rule}`),
+  '- Name the work, not the artifact used to produce it: a mock, plan, report, branch or PR.',
+  '- Instructions about subagents, tools, output formats or background runs are incidental unless they are the topic.',
+  '- Never tool, model or agent names.',
+  '- Keep ticket ids (like fe-1234) when they identify the work.',
+  '- A session about one PR or issue keeps its number as a word (pr-684, issue-12). Never drop it for a generic verb.',
+  '- Do not imply the work is finished.',
+  '- Do not repeat the cwd folder name: the workspace already shows it.',
+  ...(previous
+    ? [
+        '- A current label is given. Keep its scope words when they are still accurate.',
+        '  Replace it when it is generic, names an artifact or a finished step, or the session contradicts it.',
+      ]
+    : []),
+  ...(umbrella || others.length
+    ? ['- Supporting processes (servers, logs, shells) never define the name.']
+    : []),
+  '',
+  'Examples:',
+  '- A review session that finds one Codex roster bug stays "review-subagent-monitoring", not "codex-roster-bug".',
+  '- A vague failing test later traced to a feed mismatch becomes "fix-lazy-feed-test", not "prevent-feed-regressions".',
+  '- A QR sharing overhaul that ends in CI and merge work stays "qr-sharing", not "ci-merge-fixes".',
+  '- Addressing review comments on PR 684 "fix(borrow): wallet states on loan routes" is "pr-684-wallet-states", not "address-pr-feedback". A question about one comment ("is this an architecture fault?") does not name the subject.',
+].join('\n');
 
 if (!API_KEY) {
-  fail(`no api key — set SMART_RENAME_API_KEY in ${ENV_FILE ?? 'the plugin config dir .env'}`);
+  fail(`no api key: set SMART_RENAME_API_KEY in ${ENV_FILE ?? 'the plugin config dir .env'}`);
 }
 
 const res = await fetch(`${BASE_URL}/chat/completions`, {
@@ -202,12 +297,25 @@ const res = await fetch(`${BASE_URL}/chat/completions`, {
 }).catch((e) => fail(`model call failed: ${e.message}`));
 if (!res.ok) fail(`model call failed: HTTP ${res.status} from ${BASE_URL} (model ${MODEL})`);
 
-const label = (await res.json()).choices?.[0]?.message?.content
-  ?.trim().replace(/^["']|["']$/g, '').toLowerCase().replace(/[\s_]+/g, '-');
-const words = label ? label.split('-').length : 0;
-if (!label || words < 1 || words > 5 || label.length > 30) fail(`bad label from model: ${JSON.stringify(label)}`);
+// Models wrap the label in quotes, backticks, a bullet or a sentence. Take the
+// first non-empty line and strip the decoration before validating.
+const label = ((await res.json()).choices?.[0]?.message?.content ?? '')
+  .split(/\r?\n/)
+  .map((line) => line.trim())
+  .find((line) => line.length > 0)
+  ?.replace(/[.,;:!?]+$/, '')
+  .replace(/^['"`]+|['"`]+$/g, '')
+  .toLowerCase()
+  .replace(/[\s_]+/g, '-')
+  .replace(/^-+|-+$/g, '');
+// A label a few characters too long is still a good label. Drop trailing words
+// until it fits instead of failing the keypress and renaming nothing.
+const words = label ? label.split('-') : [];
+while (words.length > 1 && (words.length > 5 || words.join('-').length > 30)) words.pop();
+const trimmed = words.join('-');
+if (!/^[a-z0-9-]+$/.test(trimmed) || trimmed.length > 30) fail(`bad label from model: ${JSON.stringify(label)}`);
 
-apply(label);
+apply(trimmed);
 
 function apply(label) {
   if (target === 'tab') herdr('tab', 'rename', self.tab_id, label);
