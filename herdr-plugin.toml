@@ -1,6 +1,6 @@
 id = "edi.smart-rename"
 name = "Smart Rename"
-version = "0.2.0"
+version = "0.2.1"
 min_herdr_version = "0.8.0"
 description = "AI tab and pane names from agent work: transcript-aware, one keypress."
 platforms = ["linux", "macos"]

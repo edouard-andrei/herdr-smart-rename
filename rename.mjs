@@ -17,6 +17,8 @@ const MAX_CONTEXT = 4500;
 const FIRST_PROMPT_CHARS = 800;
 const RECENT_PROMPT_CHARS = 250;
 const RECENT_BUDGET_CHARS = 2500;
+// Peer agents in one tab each get their first prompt, shorter, so the umbrella sees every mission.
+const PEER_FIRST_CHARS = 300;
 
 // Config: real env vars win, then `.env` in the herdr-managed plugin config dir
 // (`herdr plugin config-dir edi.smart-rename`). See README for the keys.
@@ -58,8 +60,10 @@ if (!selfId) fail('HERDR_PANE_ID not set, run as a herdr plugin action');
 
 const self = herdr('pane', 'get', selfId).result.pane;
 // The current label is a weak prior: it steadies re-runs on an already named target,
-// and the prompt tells the model when to drop it.
-const previous = target === 'tab' ? herdr('tab', 'get', self.tab_id).result.tab.label : self.label;
+// and the prompt tells the model when to drop it. A bare number is herdr's default tab
+// label, not a prior, and the model would keep it as a work id.
+const current = target === 'tab' ? herdr('tab', 'get', self.tab_id).result.tab.label : self.label;
+const previous = /^\d+$/.test(current ?? '') ? null : current;
 let pane = self;
 let siblings = [];
 if (target === 'tab') {
@@ -78,6 +82,8 @@ if (target === 'tab') {
 // dropped. Other '<'/'#' prefixes are injected noise: system reminders, env context, AGENTS.md.
 function userPrompt(text) {
   if (!text) return null;
+  // `[Image #1]` placeholders carry no subject and look like a PR reference to prTitle.
+  text = text.replace(/\[Image #\d+\]\s*/g, '');
   const cmd = text.match(/<command-name>([^<]*)<\/command-name>(?:\s*<command-args>([^<]*)<\/command-args>)?/);
   if (cmd) return `${cmd[1]} ${cmd[2] ?? ''}`.trim();
   if (text.startsWith('<') || text.startsWith('#') || text.startsWith('Base directory for this skill:')) return null;
@@ -97,8 +103,11 @@ function agentPrompts(p) {
         .map((d) => join(root, d, `${id}.jsonl`))
         .find(existsSync);
     }
-    extract = (e) => {
-      if (e.type !== 'user') return null;
+    // Current Claude Code tags real human turns with origin.kind 'human'. Teammate messages
+    // carry no origin and task notifications another kind. Untagged transcripts (older
+    // versions) rely on userPrompt's text checks alone.
+    extract = (e, tagged) => {
+      if (e.type !== 'user' || e.isMeta || (tagged && e.origin?.kind !== 'human')) return null;
       const c = e.message?.content;
       return typeof c === 'string' ? c : Array.isArray(c) && c[0]?.type === 'text' ? c[0].text : null;
     };
@@ -110,12 +119,15 @@ function agentPrompts(p) {
     return null;
   }
   if (!file) return null;
+  const entries = readFileSync(file, 'utf8').split('\n').flatMap((line) => {
+    try { return [JSON.parse(line)]; } catch { return []; }
+  });
+  const tagged = entries.some((e) => e.origin);
   const prompts = [];
-  for (const line of readFileSync(file, 'utf8').split('\n')) {
-    let entry;
-    try { entry = JSON.parse(line); } catch { continue; }
-    const text = userPrompt(extract(entry));
-    if (text) prompts.push(text);
+  for (const entry of entries) {
+    const text = userPrompt(extract(entry, tagged));
+    // A re-sent prompt adds nothing and would spend the recent budget twice.
+    if (text && text !== prompts.at(-1)) prompts.push(text);
   }
   if (!prompts.length) return null;
   // The first prompt never repeats as a recent one, so a short session sends it once.
@@ -193,7 +205,11 @@ const paneLine = (p) => {
 const parts = [];
 if (umbrella) {
   parts.push(`Tab with ${siblings.length} panes, cwd ${pane.cwd}. The panes, agents in parallel first:`);
-  parts.push(...agentPanes.map(paneLine));
+  for (const p of agentPanes) {
+    parts.push(paneLine(p));
+    const prompts = agentPrompts(p);
+    if (prompts) parts.push(`  first request: ${clip(prompts.first, PEER_FIRST_CHARS)}`);
+  }
   parts.push(...siblings.filter((p) => !p.agent).map(paneLine));
 } else {
   parts.push(
@@ -257,7 +273,7 @@ const SYSTEM = [
   '- Name the work, not the artifact used to produce it: a mock, plan, report, branch or PR.',
   '- Instructions about subagents, tools, output formats or background runs are incidental unless they are the topic.',
   '- Never tool, model or agent names.',
-  '- Keep ticket ids (like fe-1234) when they identify the work.',
+  '- Keep ids that number the work: tickets (fe-1234), chapters, levels or milestones (memory-10, m7).',
   '- A session about one PR or issue keeps its number as a word (pr-684, issue-12). Never drop it for a generic verb.',
   '- Do not imply the work is finished.',
   '- Do not repeat the cwd folder name: the workspace already shows it.',
